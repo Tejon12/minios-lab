@@ -42,6 +42,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <libgen.h>
+#include <errno.h>
 
 // Estado global del scheduler
 static volatile int current_running = -1;   // índice en process_table del proceso RUNNING, -1 si ninguno
@@ -109,53 +110,92 @@ void scheduler_stop(void) {
 // proceso en estado T (stopped) justo después de crearlo.
 // ============================================================
 int scheduler_create_process(const char *path, const char *arg) {
-    // Paso 1. Validar que hay espacio en process_table.
-    //         Si process_count >= MAX_PROCESSES, imprimir error y retornar -1.
+    int status;
 
-    // Paso 2. Llamar fork() y guardar el resultado en una variable pid_t.
-    //         Si fork() retorna < 0, es error: perror("fork") y retornar -1.
+    // Paso 1. Validar espacio en process_table
+    if (process_count >= MAX_PROCESSES) {
+        fprintf(stderr, "Error: process_table llena (max %d procesos)\n", MAX_PROCESSES);
+        return -1;
+    }
 
-    // Paso 3. Si estamos en el HIJO (pid == 0):
-    //         a) Si platform_uses_ptrace() retorna verdadero, llamar platform_trace_child().
-    //            (En macOS esto es no-op; en Linux habilita ptrace.)
-    //         b) Llamar execl(path, path, arg, NULL) si arg != NULL,
-    //            o execl(path, path, NULL) si arg == NULL.
-    //         c) Si execl retorna, falló: perror("execl") y _exit(1).
+    // Paso 2. fork
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return -1;
+    }
 
-    // Paso 4. Si estamos en el PADRE (pid > 0) Y platform_uses_ptrace() es verdadero:
-    //         a) waitpid(pid, &status, 0) para esperar el SIGTRAP post-exec.
-    //         b) Verificar WIFSTOPPED(status). Si no está detenido: matar al hijo y retornar -1.
+    // Paso 3. Hijo: ptrace (si aplica) + exec
+    if (pid == 0) {
+        if (platform_uses_ptrace()) {
+            platform_trace_child();
+        }
+        if (arg != NULL) {
+            execl(path, path, arg, (char *)NULL);
+        } else {
+            execl(path, path, (char *)NULL);
+        }
+        perror("execl");
+        _exit(1);
+    }
 
-    // Paso 5. Crear la entrada en el PCB:
-    //         - Calcular idx = process_count (índice libre en la tabla)
-    //         - Obtener nombre corto con basename() sobre una copia de path
-    //         - Llamar pcb_init(&process_table[idx], pid, short_name)
-    //         - Liberar la copia del path
-    //
-    //         Ejemplo:
-    //             char *path_copy = strdup(path);
-    //             char *short_name = basename(path_copy);
-    //             pcb_init(&process_table[idx], pid, short_name);
-    //             free(path_copy);
+    // Paso 4. Padre: esperar el SIGTRAP post-exec (solo con ptrace)
+    if (platform_uses_ptrace()) {
+        if (waitpid(pid, &status, 0) < 0 || !WIFSTOPPED(status)) {
+            fprintf(stderr, "Error: el hijo no se detuvo tras exec\n");
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            return -1;
+        }
+    }
 
-    // Paso 6. (Solo si platform_uses_ptrace()) Intentar capturar registros iniciales:
-    //         a) Si platform_get_registers(pid, &process_table[idx].registers) retorna 0,
-    //            marcar process_table[idx].regs_valid = 1.
-    //         b) Llamar platform_detach(pid) para liberar el tracing.
+    // Paso 5. Inicializar el PCB
+    int idx = process_count;
+    char *path_copy = strdup(path);
+    if (!path_copy) {
+        perror("strdup");
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+        return -1;
+    }
+    char *short_name = basename(path_copy);
+    pcb_init(&process_table[idx], pid, short_name);
+    free(path_copy);
 
-    // Paso 7. Detener el proceso con platform_stop_process(pid).
-    //         Si falla: perror, matar, retornar -1.
+    // Paso 6. Registros iniciales y detach (solo con ptrace)
+    if (platform_uses_ptrace()) {
+        if (platform_get_registers(pid, &process_table[idx].registers) == 0) {
+            process_table[idx].regs_valid = 1;
+        }
+        platform_detach(pid);
+    }
 
-    // Paso 8. waitpid(pid, &status, WUNTRACED) para confirmar que se detuvo.
-    //         Si falla: perror, matar, retornar -1.
+    // Paso 7. Detener el proceso
+    if (platform_stop_process(pid) < 0) {
+        perror("platform_stop_process");
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+        return -1;
+    }
 
-    // Paso 9. Marcar el PCB como PROC_READY, incrementar process_count,
-    //         llamar rq_enqueue(idx), emitir monitor_emit_created(pid, name)
-    //         y si regs_valid, monitor_emit_registers(pid, pc, sp).
-    //         Retornar idx.
+    // Paso 8. Confirmar que quedo detenido
+    if (waitpid(pid, &status, WUNTRACED) < 0) {
+        perror("waitpid");
+        kill(pid, SIGKILL);
+        return -1;
+    }
 
-    (void)path; (void)arg;  // silence unused warnings while unimplemented
-    return -1;  // TODO: reemplazar por idx real
+    // Paso 9. Marcar READY, encolar y notificar
+    process_table[idx].state = PROC_READY;
+    process_count++;
+    rq_enqueue(idx);
+    monitor_emit_created(pid, process_table[idx].name);
+    if (process_table[idx].regs_valid) {
+        monitor_emit_registers(pid,
+            (unsigned long long)process_table[idx].registers.program_counter,
+            (unsigned long long)process_table[idx].registers.stack_pointer);
+    }
+    return idx;
 }
 
 
@@ -170,24 +210,27 @@ int scheduler_create_process(const char *path, const char *arg) {
 // proceso empieza a producir salida en la terminal.
 // ============================================================
 void scheduler_start(int slice_ms) {
-    // Paso 1. Si rq_is_empty(), imprimir "No hay procesos en la ready queue."
-    //         y retornar.
+    // Paso 1. Nada que arrancar si la cola esta vacia
+    if (rq_is_empty()) {
+        printf("No hay procesos en la ready queue.\n");
+        return;
+    }
 
-    // Paso 2. Desencolar el primer índice con rq_dequeue().
+    // Paso 2. Primer proceso de la cola
+    int idx = rq_dequeue();
 
-    // Paso 3. Actualizar PCB del proceso entrante:
-    //         - process_table[idx].state = PROC_RUNNING;
-    //         - clock_gettime(CLOCK_MONOTONIC, &process_table[idx].last_started);
-    //         - current_running = idx;
+    // Paso 3. Actualizar PCB entrante
+    process_table[idx].state = PROC_RUNNING;
+    clock_gettime(CLOCK_MONOTONIC, &process_table[idx].last_started);
+    current_running = idx;
 
-    // Paso 4. Reanudar el proceso con platform_resume_process(process_table[idx].pid).
+    // Paso 4. Reanudar el proceso
+    platform_resume_process(process_table[idx].pid);
 
-    // Paso 5. Activar el scheduler y arrancar el timer:
-    //         - scheduler_active = 1;
-    //         - timer_init(slice_ms, scheduler_tick);  // registra el handler
-    //         - timer_start();                         // arranca setitimer
-
-    (void)slice_ms;  // silence unused while unimplemented
+    // Paso 5. Activar scheduler y timer
+    scheduler_active = 1;
+    timer_init(slice_ms, scheduler_tick);
+    timer_start();
 }
 
 
@@ -210,35 +253,56 @@ void scheduler_start(int slice_ms) {
 void scheduler_tick(int signum) {
     (void)signum;
 
-    // Paso 1. Salida temprana: si current_running < 0 o !scheduler_active, return.
+    // Paso 1. Salida temprana
+    if (current_running < 0 || !scheduler_active) return;
 
-    // Paso 2. Obtener puntero al PCB del proceso actual:
-    //         pcb_t *current = &process_table[current_running];
+    // Paso 2. PCB del proceso actual
+    pcb_t *current = &process_table[current_running];
 
-    // Paso 3. Detener el proceso actual con platform_stop_process(current->pid).
+    // Paso 3. Detener el proceso actual
+    platform_stop_process(current->pid);
 
-    // Paso 4. Actualizar PCB del saliente:
-    //         - Obtener tiempo actual con clock_gettime(CLOCK_MONOTONIC, &now).
-    //         - Calcular elapsed = timespec_diff_ms(now, current->last_started).
-    //         - current->cpu_time_ms += elapsed;
-    //         - current->state = PROC_READY;
-    //         - current->context_switches++;
+    // Paso 4. Actualizar PCB del saliente
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double elapsed = timespec_diff_ms(now, current->last_started);
+    current->cpu_time_ms += elapsed;
+    current->state = PROC_READY;
+    current->context_switches++;
 
-    // Paso 5. Encolar el proceso saliente con rq_enqueue(current_running).
+    // Tiempo de espera de todos los procesos que estan en la cola READY:
+    // (tiempo de vida - CPU consumida). Solo aritmetica, async-signal-safe.
+    for (int i = 0; i < process_count; i++) {
+        if (process_table[i].state == PROC_READY) {
+            process_table[i].wait_time_ms =
+                timespec_diff_ms(now, process_table[i].created_at) - process_table[i].cpu_time_ms;
+            if (process_table[i].wait_time_ms < 0) process_table[i].wait_time_ms = 0;
+        }
+    }
 
-    // Paso 6. Si la cola quedó vacía (rq_is_empty()):
-    //         - current_running = -1;
-    //         - timer_stop();
-    //         - return;
+    // Paso 5. Encolar el saliente
+    int out_idx = current_running;
+    rq_enqueue(out_idx);
 
-    // Paso 7. Desencolar el siguiente, actualizar su PCB y reanudarlo:
-    //         - int next_idx = rq_dequeue();
-    //         - pcb_t *next = &process_table[next_idx];
-    //         - next->state = PROC_RUNNING;
-    //         - clock_gettime(CLOCK_MONOTONIC, &next->last_started);
-    //         - platform_resume_process(next->pid);
-    //         - monitor_emit_switch(current->pid, next->pid, timer_get_slice());
-    //         - current_running = next_idx;
+    // Paso 6. Cola vacia: no deberia ocurrir (acabamos de encolar), por seguridad
+    if (rq_is_empty()) {
+        current_running = -1;
+        timer_stop();
+        return;
+    }
+
+    // Paso 7. Siguiente proceso
+    int next_idx = rq_dequeue();
+    pcb_t *next = &process_table[next_idx];
+    next->state = PROC_RUNNING;
+    clock_gettime(CLOCK_MONOTONIC, &next->last_started);
+    platform_resume_process(next->pid);
+    current_running = next_idx;
+
+    // Solo emitir evento si realmente cambio de proceso
+    if (next_idx != out_idx) {
+        monitor_emit_switch(current->pid, next->pid, timer_get_slice());
+    }
 }
 
 
@@ -256,29 +320,53 @@ void scheduler_tick(int signum) {
 // ============================================================
 void scheduler_sigchld(int signum) {
     (void)signum;
+    int saved_errno = errno;
+    int status;
+    pid_t pid;
 
-    // Paso 1. Loop while waitpid(-1, &status, WNOHANG | WUNTRACED) > 0:
-    //         - WNOHANG para no bloquear.
-    //         - El loop recoge todos los hijos terminados pendientes.
+    // Paso 1. Recoger TODOS los hijos pendientes sin bloquear
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+        // Paso 2. Ignorar paradas (SIGSTOP): solo nos interesan las terminaciones
+        if (!WIFEXITED(status) && !WIFSIGNALED(status)) continue;
 
-    // Paso 2. Dentro del loop, IGNORAR paradas: si !WIFEXITED(status) y
-    //         !WIFSIGNALED(status), continue (el proceso solo se detuvo,
-    //         no terminó).
+        // Paso 3. Buscar el PID en la tabla
+        int i;
+        for (i = 0; i < process_count; i++) {
+            if (process_table[i].pid == pid) break;
+        }
+        if (i >= process_count) continue;
+        if (process_table[i].state == PROC_TERMINATED) continue;
 
-    // Paso 3. Buscar el PID en process_table (loop por los process_count).
-    //         Ignorar si ya está PROC_TERMINATED.
+        // Paso 5a. Si era el RUNNING, sumar el ultimo tramo de CPU
+        int was_running = (i == current_running);
+        if (was_running) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            process_table[i].cpu_time_ms += timespec_diff_ms(now, process_table[i].last_started);
+        }
 
-    // Paso 4. Marcar process_table[i].state = PROC_TERMINATED y
-    //         llamar monitor_emit_terminated(pid, cpu_time_ms, context_switches).
+        // Paso 4. Marcar TERMINATED y notificar
+        process_table[i].state = PROC_TERMINATED;
+        monitor_emit_terminated(pid, process_table[i].cpu_time_ms, process_table[i].context_switches);
 
-    // Paso 5. Si i == current_running (el que terminó era el que corría):
-    //         a) Actualizar cpu_time_ms con el elapsed desde last_started.
-    //         b) current_running = -1;
-    //         c) Si !rq_is_empty(): desencolar siguiente, marcarlo RUNNING,
-    //            registrar last_started y platform_resume_process.
-    //            Luego current_running = next.
-    //         d) Si rq_is_empty(): timer_stop(); scheduler_active = 0;
-
-    // Paso 6. Si i != current_running (estaba en la cola esperando):
-    //         rq_remove(i);
+        if (was_running) {
+            // Paso 5b-d. Despachar al siguiente o apagar el timer
+            current_running = -1;
+            if (!rq_is_empty()) {
+                int next = rq_dequeue();
+                process_table[next].state = PROC_RUNNING;
+                clock_gettime(CLOCK_MONOTONIC, &process_table[next].last_started);
+                platform_resume_process(process_table[next].pid);
+                current_running = next;
+                monitor_emit_switch(pid, process_table[next].pid, timer_get_slice());
+            } else {
+                timer_stop();
+                scheduler_active = 0;
+            }
+        } else {
+            // Paso 6. Estaba esperando en la cola
+            rq_remove(i);
+        }
+    }
+    errno = saved_errno;
 }
